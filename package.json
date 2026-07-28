@@ -1,8 +1,8 @@
 {
   "name": "cerne-isolate",
-  "version": "0.1.0",
-  "updated": "2026.07.28.1140",
-  "description": "Executa tarefas Node.js em processos filhos descartáveis com IPC estruturado, timeout, cancelamento, concorrência limitada e encerramento confirmado.",
+  "version": "0.2.0",
+  "updated": "2026.07.28.1239",
+  "description": "Executa tarefas Node.js em processos filhos descartáveis ou reutilizáveis, com IPC estruturado, timeout, cancelamento, concorrência limitada e encerramento confirmado.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -42,6 +42,8 @@
   "keywords": [
     "child-process",
     "process-isolation",
+    "process-pool",
+    "worker-pool",
     "ipc",
     "concurrency",
     "timeout",

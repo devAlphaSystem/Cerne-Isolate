@@ -24,6 +24,16 @@ export type ProcessAbortSource = "signal" | "shutdown";
 export type ProcessTerminationStage = "natural" | "sigterm" | "sigkill";
 
 /**
+ * Identifies the lifecycle contract negotiated with a worker process.
+ */
+export type ProcessExecutionMode = "disposable" | "reusable";
+
+/**
+ * Identifies why a pooled process stopped accepting new tasks.
+ */
+export type ProcessRecycleReason = "failure" | "max-jobs" | "max-lifetime" | "idle" | "shutdown";
+
+/**
  * Describes an error thrown by a handler using only IPC-safe primitives.
  */
 export interface SerializedProcessError {
@@ -35,13 +45,25 @@ export interface SerializedProcessError {
 }
 
 /**
- * Reports that one process was created for an accepted task.
+ * Reports that a child process was created. Only the pool emits it, because a disposable
+ * execution already reports its single process through `start`.
+ */
+export interface ProcessSpawnEvent {
+  readonly type: "spawn";
+  readonly processId: number;
+  readonly pid: number | null;
+}
+
+/**
+ * Reports that one process began an accepted task.
  */
 export interface ProcessStartEvent {
   readonly type: "start";
+  readonly processId: number;
   readonly taskId: number;
   readonly pid: number | null;
   readonly queuedMs: number;
+  readonly reused: boolean;
 }
 
 /**
@@ -49,28 +71,54 @@ export interface ProcessStartEvent {
  */
 export interface ProcessEndEvent {
   readonly type: "end";
+  readonly processId: number;
   readonly taskId: number;
   readonly outcome: "success" | ProcessErrorCode;
   readonly durationMs: number;
 }
 
 /**
- * Confirms that a child and its IPC channel have closed.
+ * Reports that a pooled process finished a task and is waiting for the next one.
+ */
+export interface ProcessIdleEvent {
+  readonly type: "idle";
+  readonly processId: number;
+  readonly pid: number | null;
+  readonly jobs: number;
+}
+
+/**
+ * Reports that a pooled process was removed from rotation and is being terminated.
+ */
+export interface ProcessRecycleEvent {
+  readonly type: "recycle";
+  readonly processId: number;
+  readonly pid: number | null;
+  readonly reason: ProcessRecycleReason;
+  readonly jobs: number;
+}
+
+/**
+ * Confirms that a child and its IPC channel have closed. `taskId` names the task the process
+ * still owned at that moment: always a number for a disposable execution, and `null` when a
+ * pooled process closes while idle or while being recycled.
  */
 export interface ProcessCloseEvent {
   readonly type: "close";
-  readonly taskId: number;
+  readonly processId: number;
+  readonly taskId: number | null;
   readonly pid: number | null;
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
   readonly termination: ProcessTerminationStage;
   readonly totalDurationMs: number;
+  readonly jobs: number;
 }
 
 /**
  * Provides lifecycle telemetry without including payloads, results, worker paths, or error details.
  */
-export type ProcessExecutorEvent = ProcessStartEvent | ProcessEndEvent | ProcessCloseEvent;
+export type ProcessExecutorEvent = ProcessSpawnEvent | ProcessStartEvent | ProcessEndEvent | ProcessIdleEvent | ProcessRecycleEvent | ProcessCloseEvent;
 
 /**
  * Receives optional lifecycle telemetry. Listener failures are isolated from task execution.
@@ -96,6 +144,18 @@ export interface ProcessExecutorOptions {
 }
 
 /**
+ * Configures a bounded pool that reuses worker processes between tasks.
+ */
+export interface ProcessPoolOptions extends ProcessExecutorOptions {
+  /** Terminates a process after this many milliseconds without work. Required, between 1 and 2147483647. */
+  idleTimeoutMs: number;
+  /** Recycles a process after this many successful tasks. Zero disables the limit. Defaults to 10. */
+  maxJobsPerProcess?: number;
+  /** Recycles a process once its lifetime reaches this value, never interrupting a healthy task. Zero disables the limit. Defaults to 600000. */
+  maxLifetimeMs?: number;
+}
+
+/**
  * Configures one submitted task.
  */
 export interface ProcessRunOptions {
@@ -104,16 +164,23 @@ export interface ProcessRunOptions {
 }
 
 /**
- * Runs typed payloads in disposable child processes.
+ * Runs typed payloads in child processes.
  */
 export interface ProcessExecutor<Payload, Result> {
   /** Enqueues or immediately starts one task. */
   run(payload: Payload, options?: ProcessRunOptions): Promise<Result>;
-  /** Stops admission, rejects queued work, terminates active children, and waits for every `close`. */
+  /** Stops admission, rejects queued work, terminates every child, and waits for every `close`. */
   close(): Promise<void>;
 }
 
 /**
- * Implements one process worker. Each child invokes the handler at most once.
+ * Runs typed payloads in reusable child processes. The surface is the same one returned by
+ * `createProcessExecutor`, so both modes are interchangeable at the call site.
+ */
+export type ProcessPool<Payload, Result> = ProcessExecutor<Payload, Result>;
+
+/**
+ * Implements one process worker. A disposable child invokes the handler once; a pooled child
+ * invokes it once per assigned task, never concurrently.
  */
 export type ProcessHandler<Payload, Result> = (payload: Payload) => Result | PromiseLike<Result>;

@@ -1,17 +1,29 @@
 import { fileURLToPath } from "node:url";
 import { isAbsolute } from "node:path";
 
-import type { ProcessEventListener, ProcessExecutorOptions } from "./types";
+import type { ProcessEventListener, ProcessExecutorOptions, ProcessPoolOptions } from "./types";
 
 const MAX_TIMER_MS = 2_147_483_647;
 
-export interface ResolvedProcessExecutorOptions {
+/** Recycles a process after ten successful tasks, so a leak in the handler cannot grow unbounded. */
+const DEFAULT_MAX_JOBS_PER_PROCESS = 10;
+/** Recycles a process after ten minutes, so a long-lived pool still renews its children. */
+const DEFAULT_MAX_LIFETIME_MS = 600_000;
+
+export interface ResolvedPoolPolicy {
+  idleTimeoutMs: number;
+  maxJobsPerProcess: number;
+  maxLifetimeMs: number;
+}
+
+export interface ResolvedProcessOptions {
   workerPath: string;
   concurrency: number;
   maxQueue: number;
   timeoutMs: number;
   killGraceMs: number;
   onEvent?: ProcessEventListener;
+  pool?: ResolvedPoolPolicy;
 }
 
 function integerInRange(name: string, value: number | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -38,7 +50,7 @@ function resolveWorkerPath(worker: ProcessExecutorOptions["worker"]): string {
 /**
  * Validates executor configuration while preserving a fixed, application-selected worker path.
  */
-export function resolveProcessExecutorOptions(options: ProcessExecutorOptions): ResolvedProcessExecutorOptions {
+export function resolveProcessExecutorOptions(options: ProcessExecutorOptions): ResolvedProcessOptions {
   if (typeof options !== "object" || options === null) {
     throw new TypeError("options must be an object.");
   }
@@ -53,5 +65,21 @@ export function resolveProcessExecutorOptions(options: ProcessExecutorOptions): 
     timeoutMs: integerInRange("timeoutMs", options.timeoutMs, 60_000, 0, MAX_TIMER_MS),
     killGraceMs: integerInRange("killGraceMs", options.killGraceMs, 250, 0, 60_000),
     ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
+  };
+}
+
+/**
+ * Validates pool configuration on top of the shared executor rules. The idle deadline is required
+ * because a pool without one would keep processes alive for the lifetime of the application.
+ */
+export function resolveProcessPoolOptions(options: ProcessPoolOptions): ResolvedProcessOptions {
+  const base = resolveProcessExecutorOptions(options);
+  return {
+    ...base,
+    pool: {
+      idleTimeoutMs: integerInRange("idleTimeoutMs", options.idleTimeoutMs, Number.NaN, 1, MAX_TIMER_MS),
+      maxJobsPerProcess: integerInRange("maxJobsPerProcess", options.maxJobsPerProcess, DEFAULT_MAX_JOBS_PER_PROCESS, 0, 1_000_000),
+      maxLifetimeMs: integerInRange("maxLifetimeMs", options.maxLifetimeMs, DEFAULT_MAX_LIFETIME_MS, 0, MAX_TIMER_MS),
+    },
   };
 }

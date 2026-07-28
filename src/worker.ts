@@ -1,5 +1,5 @@
-import { cloneIpcValue, parseRunMessage, protocolEnvelope, serializeProcessError } from "./protocol";
-import type { ProcessHandler, SerializedProcessError } from "./types";
+import { cloneIpcValue, parseParentMessage, protocolEnvelope, serializeProcessError, SUPPORTED_MODES, type RunMessage } from "./protocol";
+import type { ProcessExecutionMode, ProcessHandler, SerializedProcessError } from "./types";
 
 let handlerDefined = false;
 let exiting = false;
@@ -41,16 +41,11 @@ function disconnectAndExit(exitCode: number): void {
   process.exit(exitCode);
 }
 
-async function sendFinalMessage(message: object, exitCode: number): Promise<void> {
-  try {
-    await sendToParent(message);
-  } finally {
-    disconnectAndExit(exitCode);
-  }
-}
-
 /**
- * Registers exactly one typed task handler in a process created by `createProcessExecutor`.
+ * Registers exactly one typed task handler in a process created by `createProcessExecutor` or
+ * `createProcessPool`. The lifecycle is negotiated by the parent: a disposable process exits
+ * after its first response, while a reusable process stays available after a successful result
+ * and exits on any failure, on a shutdown request or when the IPC channel is disconnected.
  */
 export function defineProcessHandler<Payload = unknown, Result = unknown>(handler: ProcessHandler<Payload, Result>): void {
   if (handlerDefined) {
@@ -68,56 +63,98 @@ export function defineProcessHandler<Payload = unknown, Result = unknown>(handle
     process.exit(process.exitCode ?? 1);
   });
 
-  let consumed = false;
+  let mode: ProcessExecutionMode | null = null;
+  let busy = false;
+  let lastTaskId = 0;
+  let stopRequested = false;
+
   const onMessage = (rawMessage: unknown): void => {
-    if (consumed) {
+    if (exiting) {
       return;
     }
-    const message = parseRunMessage(rawMessage);
+    const message = parseParentMessage(rawMessage);
     if (message === null) {
-      consumed = true;
-      process.removeListener("message", onMessage);
-      void sendFinalMessage({ ...protocolEnvelope(), type: "protocol-error" }, 1).catch(() => {
-        disconnectAndExit(1);
-      });
+      rejectProtocol();
       return;
     }
-
-    consumed = true;
-    process.removeListener("message", onMessage);
-    void (async () => {
-      let result: Result;
-      try {
-        result = await handler(message.payload as Payload);
-      } catch (error) {
-        const serializedError = serializeProcessError(error);
-        let ipcError: SerializedProcessError;
-        try {
-          ipcError = cloneIpcValue(serializedError);
-        } catch {
-          await sendFinalMessage({ ...protocolEnvelope(), type: "serialization-error", taskId: message.taskId, direction: "error" }, 1);
-          return;
-        }
-        await sendFinalMessage({ ...protocolEnvelope(), type: "handler-error", taskId: message.taskId, error: ipcError }, 1);
-        return;
+    if (message.type === "shutdown") {
+      stopRequested = true;
+      if (!busy) {
+        finish(0);
       }
-
-      let ipcResult: Result;
-      try {
-        ipcResult = cloneIpcValue(result);
-      } catch {
-        await sendFinalMessage({ ...protocolEnvelope(), type: "serialization-error", taskId: message.taskId, direction: "result" }, 1);
-        return;
-      }
-      await sendFinalMessage({ ...protocolEnvelope(), type: "result", taskId: message.taskId, result: ipcResult }, 0);
-    })().catch(() => {
-      disconnectAndExit(1);
+      return;
+    }
+    if (busy || stopRequested || message.taskId <= lastTaskId || (mode !== null && message.mode !== mode)) {
+      rejectProtocol();
+      return;
+    }
+    mode = message.mode;
+    lastTaskId = message.taskId;
+    busy = true;
+    void execute(message).catch(() => {
+      finish(1);
     });
   };
 
+  function finish(exitCode: number): void {
+    process.removeListener("message", onMessage);
+    disconnectAndExit(exitCode);
+  }
+
+  async function respondAndFinish(message: object, exitCode: number): Promise<void> {
+    try {
+      await sendToParent(message);
+    } finally {
+      finish(exitCode);
+    }
+  }
+
+  function rejectProtocol(): void {
+    void respondAndFinish({ ...protocolEnvelope(), type: "protocol-error" }, 1).catch(() => {
+      finish(1);
+    });
+  }
+
+  async function execute(request: RunMessage<unknown>): Promise<void> {
+    let result: Result;
+    try {
+      result = await handler(request.payload as Payload);
+    } catch (error) {
+      const serializedError = serializeProcessError(error);
+      let ipcError: SerializedProcessError;
+      try {
+        ipcError = cloneIpcValue(serializedError);
+      } catch {
+        await respondAndFinish({ ...protocolEnvelope(), type: "serialization-error", taskId: request.taskId, direction: "error" }, 1);
+        return;
+      }
+      await respondAndFinish({ ...protocolEnvelope(), type: "handler-error", taskId: request.taskId, error: ipcError }, 1);
+      return;
+    }
+
+    let ipcResult: Result;
+    try {
+      ipcResult = cloneIpcValue(result);
+    } catch {
+      await respondAndFinish({ ...protocolEnvelope(), type: "serialization-error", taskId: request.taskId, direction: "result" }, 1);
+      return;
+    }
+
+    const response = { ...protocolEnvelope(), type: "result", taskId: request.taskId, result: ipcResult };
+    if (request.mode === "disposable") {
+      await respondAndFinish(response, 0);
+      return;
+    }
+    await sendToParent(response);
+    busy = false;
+    if (stopRequested) {
+      finish(0);
+    }
+  }
+
   process.on("message", onMessage);
-  void sendToParent({ ...protocolEnvelope(), type: "ready" }).catch(() => {
-    disconnectAndExit(1);
+  void sendToParent({ ...protocolEnvelope(), type: "ready", modes: [...SUPPORTED_MODES] }).catch(() => {
+    finish(1);
   });
 }
 

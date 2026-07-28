@@ -19,6 +19,8 @@ const TIMEOUT_MS = 300;
 const KILL_GRACE_MS = 100;
 /** Espera antes de cancelar ou fechar, para que os filhos já estejam dentro do handler. */
 const SETTLE_MS = 120;
+/** Prazo de inatividade dos casos de pool: alto o bastante para nunca vencer durante um caso. */
+const IDLE_TIMEOUT_MS = 30_000;
 /** Iterações do worker de CPU: cerca de 30 ms de trabalho por tarefa. */
 const CPU_ROUNDS = 6_000_000;
 /**
@@ -95,6 +97,11 @@ const CASES = [
   { worker: "crash.mjs", label: "saída no startup", scenario: () => batch("crash.mjs", {}, [TINY_PAYLOAD]) },
   { worker: "rogue.mjs", label: "protocolo inválido", scenario: () => batch("rogue.mjs", {}, [TINY_PAYLOAD]) },
   { worker: "digest.mjs", label: "executor fechado", scenario: closedExecutorScenario },
+  { worker: "digest.mjs", label: "pool 8 tarefas c1", scenario: () => poolBatch("digest.mjs", { concurrency: 1, maxQueue: 32 }, repeated(TINY_PAYLOAD, 8)) },
+  { worker: "digest.mjs", label: "pool 8 tarefas c4", scenario: () => poolBatch("digest.mjs", { concurrency: 4, maxQueue: 32 }, repeated(TINY_PAYLOAD, 8)) },
+  { worker: "digest.mjs", label: "pool 32 tarefas c4 na fila", scenario: () => poolBatch("digest.mjs", { concurrency: 4, maxQueue: 32, maxJobsPerProcess: 0 }, repeated(TINY_PAYLOAD, 32)) },
+  { worker: "digest.mjs", label: "pool 8 tarefas c1 reciclando", scenario: () => poolBatch("digest.mjs", { concurrency: 1, maxQueue: 32, maxJobsPerProcess: 2 }, repeated(TINY_PAYLOAD, 8)) },
+  { worker: "cpu.mjs", label: "pool 4 tarefas c4", scenario: () => poolBatch("cpu.mjs", { concurrency: 4 }, repeated(CPU_PAYLOAD, 4)) },
 ];
 
 function parseArguments(argv) {
@@ -138,7 +145,7 @@ if (!existsSync(fileURLToPath(WORKER_DIRECTORY))) {
   throw new Error(`Workers do benchmark ausentes em ${fileURLToPath(WORKER_DIRECTORY)}.`);
 }
 
-const { createProcessExecutor } = await import(DIST_ENTRY.href);
+const { createProcessExecutor, createProcessPool } = await import(DIST_ENTRY.href);
 
 const selected = options.filter === null ? CASES : CASES.filter((entry) => `${entry.worker} [${entry.label}]`.includes(options.filter));
 if (selected.length === 0) {
@@ -201,29 +208,42 @@ async function withDeadline(pending) {
 }
 
 /**
- * Cria um executor, roda o cenário e fecha tudo. O tempo do caso inclui `fork`, handshake,
- * execução, resposta e a confirmação de `close`, que é o custo real de uma tarefa isolada.
+ * Cria um executor ou um pool, roda o cenário e fecha tudo. O tempo do caso inclui `fork`,
+ * handshake, execução, resposta e a confirmação de `close`. No modo descartável esse é o custo
+ * real de uma tarefa isolada; no pool, o mesmo tempo mostra quanto do custo o reúso elimina.
  */
-async function withExecutor(worker, configuration, body) {
+async function withRuntime(create, worker, configuration, body) {
   const monitor = createMonitor();
-  const executor = createProcessExecutor({
+  const runtime = create({
     worker: new URL(worker, WORKER_DIRECTORY),
     onEvent: monitor.listen,
     ...configuration,
   });
   const pending = (async () => {
     try {
-      return await body(executor, monitor);
+      return await body(runtime, monitor);
     } finally {
-      await executor.close();
+      await runtime.close();
     }
   })();
   const results = await withDeadline(pending);
   return { results: results === EXPIRED ? null : results, events: monitor.events };
 }
 
+function withExecutor(worker, configuration, body) {
+  return withRuntime(createProcessExecutor, worker, configuration, body);
+}
+
+function withPool(worker, configuration, body) {
+  return withRuntime(createProcessPool, worker, { idleTimeoutMs: IDLE_TIMEOUT_MS, ...configuration }, body);
+}
+
 function batch(worker, configuration, payloads) {
   return withExecutor(worker, configuration, (executor) => Promise.all(payloads.map((payload) => settle(executor.run(payload)))));
+}
+
+function poolBatch(worker, configuration, payloads) {
+  return withPool(worker, configuration, (pool) => Promise.all(payloads.map((payload) => settle(pool.run(payload)))));
 }
 
 function abortActiveScenario() {
@@ -376,14 +396,21 @@ function describeResult(entry) {
   return described;
 }
 
+/** Eventos que descrevem o processo, e não a tarefa. Só o pool os emite. */
+const PROCESS_EVENTS = new Set(["spawn", "idle", "recycle"]);
+
 /**
  * Agrupa os eventos por tarefa. A ordem entre tarefas concorrentes depende do escalonador do
  * sistema, mas a sequência dentro de uma tarefa e o conjunto por identificador não dependem.
  * Duração, PID, código de saída e sinal ficam de fora por variarem entre execuções e sistemas.
+ * Os eventos sem tarefa associada ficam de fora daqui e entram no resumo de processos.
  */
 function describeTasks(events) {
   const tasks = new Map();
   for (const event of events) {
+    if (event.taskId === undefined || event.taskId === null) {
+      continue;
+    }
     const task = tasks.get(event.taskId) ?? { taskId: event.taskId, lifecycle: [], outcome: null, termination: null, exit: null };
     task.lifecycle.push(event.type);
     if (event.type === "end") {
@@ -398,12 +425,45 @@ function describeTasks(events) {
   return [...tasks.values()].sort((left, right) => left.taskId - right.taskId).map((task) => ({ ...task, lifecycle: task.lifecycle.join(" ") }));
 }
 
+function tally(values) {
+  const counts = {};
+  for (const value of values.sort()) {
+    counts[value] = (counts[value] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/**
+ * Resume o ciclo de vida dos processos de um caso de pool. Quantas tarefas cada processo atendeu
+ * depende do escalonador quando há mais de uma vaga, então o resumo agrega: quantos processos
+ * existiram, quantas tarefas eles concluíram no total, por que foram reciclados e se saíram
+ * limpos. Um caso descartável não emite nenhum evento de processo e devolve `undefined`, o que
+ * mantém o snapshot dele idêntico ao das versões anteriores.
+ */
+function describeProcesses(events) {
+  if (!events.some((event) => PROCESS_EVENTS.has(event.type))) {
+    return undefined;
+  }
+  const closes = events.filter((event) => event.type === "close");
+  return {
+    processos: new Set(events.filter((event) => event.type === "spawn").map((event) => event.processId)).size,
+    tarefas: closes.reduce((total, event) => total + event.jobs, 0),
+    motivos: tally(events.filter((event) => event.type === "recycle").map((event) => event.reason)),
+    saidas: tally(closes.map((event) => (event.exitCode === 0 && event.signal === null ? "limpo" : "encerrado"))),
+  };
+}
+
 function snapshotOf(run) {
-  return { results: run.results === null ? "não assentou" : run.results.map(describeResult), tasks: describeTasks(run.events) };
+  const snapshot = { results: run.results === null ? "não assentou" : run.results.map(describeResult), tasks: describeTasks(run.events) };
+  const processes = describeProcesses(run.events);
+  if (processes !== undefined) {
+    snapshot.processes = processes;
+  }
+  return snapshot;
 }
 
 function summarize(snapshot) {
-  const children = snapshot.tasks.filter((task) => task.lifecycle.includes("close")).length;
+  const children = snapshot.processes === undefined ? snapshot.tasks.filter((task) => task.lifecycle.includes("close")).length : snapshot.processes.processos;
   const outcomes = summarizeResults(snapshot.results);
   return `${outcomes.padEnd(30)} ${String(children).padStart(2)} filho(s)`;
 }

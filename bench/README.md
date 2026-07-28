@@ -1,161 +1,144 @@
 # Benchmark
 
-Mede o custo de executar tarefas em processos descartáveis e verifica que uma
-mudança não alterou o resultado observável do executor. Os workers são
-determinísticos e não dependem de rede, disco ou de qualquer entrada privada.
+Mede o custo de criação, IPC, execução, encerramento e reúso de processos e verifica que uma mudança não alterou os desfechos observáveis dos cenários. Os payloads e workers são sintéticos e determinísticos; nenhum dado de produção é necessário.
+
+O benchmark não é uma suíte de testes unitários nem integra o workflow de CI atual. Ele serve para investigar regressões comportamentais e de desempenho do runtime.
 
 ## Uso
+
+O runner importa `dist/index.js` e os workers importam `dist/worker.js`. Gere o build antes:
 
 ```bash
 npm run build
 npm run bench
 ```
 
-Diferente dos outros pacotes do Cerne, aqui não há gerador de fixtures: as
-fixtures deste benchmark são workers, e código-fonte fica versionado em
-`bench/workers/`. O que o benchmark precisa é do `dist/`, porque os workers
-importam `dist/worker.js` e o runner importa `dist/index.js` — é a biblioteca
-compilada que está sendo medida, não `src/`.
-
-## Verificando uma otimização
-
-Grave a execução de referência antes de mexer em `src/`, e confronte depois:
+O script `bench` executa `node --expose-gc bench/run.mjs`. Também é possível chamar o runner diretamente:
 
 ```bash
-git stash && npm run build && npm run bench -- --repeats 3 --save antes
-git stash pop && npm run build && npm run bench -- --repeats 3 --compare antes
+node --expose-gc bench/run.mjs
 ```
 
-A comparação confronta, para cada caso, o resultado de cada `run()` na ordem de
-submissão — status, classe, `code`, mensagem, `source`, `phase`, `direction`,
-`exitCode`, `signal`, `timeoutMs`, `maxQueue`, `remoteError` e o digest SHA-256
-do valor devolvido — e o ciclo de vida de cada tarefa: quais eventos ela emitiu,
-o `outcome` do `end`, o estágio de encerramento e se o filho saiu limpo. Qualquer
-divergência em um caso presente nas duas execuções é listada e o processo sai com
-código 1, então a comparação serve em CI.
+Não há gerador de fixtures. Todos os workers necessários estão versionados em `bench/workers/`.
 
-Ficam de fora do snapshot, por variarem entre execuções sem que o comportamento
-mude: as durações (`queuedMs`, `durationMs`, `totalDurationMs`), o PID, o stack
-das exceções e o código de saída numérico do filho — este último entra apenas
-como `limpo` ou `encerrado`.
+## Opções
 
-A ordem entre tarefas concorrentes também fica de fora: os eventos são agrupados
-por tarefa antes da comparação, já que qual dos quatro filhos fica pronto
-primeiro é decisão do escalonador do sistema. A sequência dentro de uma tarefa,
-essa sim, é confrontada.
+| Opção            | Exemplo                 | Função                                                                  |
+| ---------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `--repeats N`    | `--repeats 3`           | Executa cada caso N vezes e guarda o melhor tempo e o menor pico medido |
+| `--filter TEXTO` | `--filter "digest.mjs"` | Seleciona casos cujo `worker [rótulo]` contém o texto                   |
+| `--save NOME`    | `--save antes`          | Grava linhas e snapshots em `bench/results/NOME.json`                   |
+| `--compare NOME` | `--compare antes`       | Compara a execução com um resultado salvo                               |
 
-## Interpretando os números
+Ao usar um script npm, separe os argumentos com `--`:
 
-O tempo de cada caso é o melhor de `--repeats`, medido do `createProcessExecutor`
-até o `close()` confirmado. Ele é dominado pelo `fork` e pelo startup do Node no
-filho: uma tarefa trivial custa dezenas de milissegundos, e quase tudo isso é
-processo, não biblioteca. É por isso que os casos de CPU existem — eles mostram
-quanto do tempo total some quando o handler tem trabalho de verdade.
+```bash
+npm run bench -- --repeats 3 --filter "pool"
+```
 
-A variação entre execuções é baixa para um benchmark, porque o custo medido é de
-processo e não de cálculo: duas execuções seguidas ficam dentro de 5% em quase
-todos os casos. Ainda assim, use `--repeats 3` e leve a sério só diferenças acima
-de ~15%, ou o total da suíte. A saída, ao contrário do tempo, é determinística —
-uma divergência ali é sempre real.
+## Verificar uma mudança
 
-A coluna de memória é o pico de RSS **do processo pai**, medido por amostragem a
-cada 10 ms sobre uma linha de base tirada depois de um GC. Os filhos são
-processos separados e o sistema operacional os contabiliza à parte: eles não
-aparecem aqui. O número é alto exatamente onde a documentação avisa que seria —
-no payload de 16 MiB, onde o pai mantém o buffer original, o snapshot de admissão
-e a cópia serializada do IPC ao mesmo tempo.
+Grave uma referência com o código de origem e o build correspondentes:
 
-Nessa coluna, só os casos de megabytes têm sinal. Os demais movimentam frações de
-MiB, onde o alocador devolve páginas quando quer e a variação percentual entre
-duas execuções idênticas chega a 100% sem que nada tenha mudado. Trate como
-confiável o pico do caso de 16 MiB e o pico máximo da suíte.
+```bash
+npm run build
+npm run bench -- --repeats 3 --save antes
+```
 
-`npm run bench` já passa `--expose-gc`; rodando `node bench/run.mjs` direto, sem
-essa flag, as linhas de base ficam sujas e os picos saem inflados.
+Depois da alteração, gere novamente o build e compare:
 
-Nenhum caso saudável passa de um segundo. Um caso que não assenta em 4 segundos
-vira a linha `*** não assentou ***`, com o ciclo de vida parcial gravado no
-snapshot, em vez de travar a suíte inteira. A última seção deste arquivo explica
-por que esse limite existe.
+```bash
+npm run build
+npm run bench -- --repeats 3 --compare antes
+```
 
-## Workers
+`bench/results/` é um diretório gerado e ignorado pelo repositório. Escolha nomes próprios para a máquina e o cenário. O arquivo `v0.1.0.json` existente é uma referência histórica e não representa automaticamente o comportamento ou o desempenho da versão atual.
 
-| Worker               | Papel                                                      |
-| -------------------- | ---------------------------------------------------------- |
-| `digest.mjs`         | Reduz o payload a um resumo: mede o IPC de ida             |
-| `produce.mjs`        | Devolve um Buffer do tamanho pedido: mede o IPC de volta   |
-| `echo.mjs`           | Devolve o payload intacto: verifica o structured clone     |
-| `cpu.mjs`            | Trabalho de CPU determinístico: a carga real de um handler |
-| `hang.mjs`           | Nunca resolve: timeout, cancelamento, fila e shutdown      |
-| `stubborn.mjs`       | Ignora SIGTERM e trava o event loop: escalada até SIGKILL  |
-| `boom.mjs`           | Lança erro com código e causa: serialização do erro        |
-| `unserializable.mjs` | Devolve uma função: falha de serialização no resultado     |
-| `crash.mjs`          | Sai antes do handshake: `PROCESS_EXIT` na fase de startup  |
-| `rogue.mjs`          | Fala fora do protocolo versionado: `PROCESS_PROTOCOL`      |
+## O que a comparação verifica
 
-`hang.mjs` e `stubborn.mjs` têm um prazo de segurança interno para não deixarem
-processos órfãos se a suíte for interrompida no meio de um caso.
+Cada caso produz um snapshot estável de:
+
+- resultado resolvido ou classe, código e propriedades estruturadas da rejeição;
+- sequência de eventos por tarefa;
+- outcome terminal;
+- forma de encerramento reduzida a limpa ou encerrada;
+- estágio de terminação solicitado;
+- quantidade agregada de processos e tarefas do pool;
+- motivos de reciclagem;
+- conteúdo estruturado, com SHA-256 para buffers e views binárias.
+
+Dados instáveis ficam fora do snapshot ou são normalizados:
+
+- PID;
+- duração de tarefa e de processo;
+- stack de erros;
+- caminhos absolutos;
+- ordem global entre tarefas concorrentes;
+- código/sinal exatos quando basta distinguir saída limpa de encerrada.
+
+Uma diferença de snapshot em caso presente nas duas execuções é marcada como `DIFERENTE` e define código de saída 1. Diferenças apenas de tempo ou memória são mostradas como percentuais, mas não falham o processo. Um caso novo é informado separadamente.
+
+O comparador percorre os casos da execução atual. Um caso existente somente no baseline — por ter sido removido ou renomeado — não é reportado; confira também a lista de casos ao revisar a comparação.
+
+## Interpretar tempo
+
+O tempo de um caso inclui:
+
+- criação do executor ou pool;
+- `fork` e handshake dos filhos necessários;
+- cópias e IPC;
+- execução do handler;
+- resposta;
+- `close()` e confirmação do encerramento.
+
+No executor descartável, esse é o custo real completo de cada tarefa isolada. No pool, o número mostra quanto do startup é amortizado pelo reúso.
+
+Antes dos casos medidos, o runner aquece a importação e uma execução pequena com `digest.mjs`. Com `--repeats`, a coluna usa o melhor tempo, reduzindo ruído de escalonamento e cold paths ocasionais. Compare na mesma máquina, versão de Node.js e condição de carga; casos curtos podem variar significativamente entre execuções.
+
+O total soma os melhores tempos por caso, não representa uma única execução contínua real.
+
+## Interpretar memória
+
+A coluna de memória mede, por amostragem a cada 10 ms, o aumento do RSS do processo pai sobre uma linha de base coletada depois de tentativas de GC.
+
+Ela não soma diretamente a memória dos processos filhos, que o sistema operacional contabiliza separadamente. Portanto:
+
+- use a coluna para detectar mudanças no custo do pai, da fila, dos snapshots e do IPC;
+- não a interprete como memória total do conjunto pai + filhos;
+- use medição externa do sistema ou contêiner para capacidade total;
+- prefira `--repeats 3` e tendências amplas em vez de pequenas diferenças por caso.
+
+Sem `--expose-gc`, o runner continua funcionando, mas informa que as linhas de base podem ficar menos estáveis. `npm run bench` já inclui a flag.
 
 ## Casos
 
-Os primeiros cinco casos isolam o preço do isolamento: uma tarefa sozinha, oito
-tarefas em série e as mesmas oito com `concurrency` 2 e 4, mais uma fila de 32
-tarefas para quatro vagas. A comparação entre eles mostra o ganho real de
-paralelizar processos nesta máquina.
+| Grupo              | Workers/cenários                          | Caminho exercitado                                                          |
+| ------------------ | ----------------------------------------- | --------------------------------------------------------------------------- |
+| Base               | `digest.mjs`, 1 e 8 tarefas               | Fork, handshake, payload pequeno, fila e concorrência 1/2/4                 |
+| Fila               | 32 tarefas, concorrência 4                | Ordem FIFO e enfileiramento sustentado                                      |
+| IPC grande         | request de 1 MiB e 16 MiB                 | Cópia e envio de payload binário                                            |
+| Resultado grande   | `produce.mjs`, 16 MiB                     | Criação, cópia e retorno de Buffer                                          |
+| Tipos estruturados | `echo.mjs`                                | `BigInt`, `Date`, `RegExp`, Buffer, typed array, `Map`, `Set` e aninhamento |
+| CPU                | `cpu.mjs` com concorrência 1 e 4          | Trabalho síncrono intensivo e paralelismo entre processos                   |
+| Timeout            | `hang.mjs`                                | Handler que nunca resolve e encerramento por prazo                          |
+| Escalada           | `stubborn.mjs`                            | Handler bloqueante que ignora `SIGTERM` até `SIGKILL`                       |
+| Cancelamento       | aborto ativo e na fila                    | Remoção de fila e encerramento de filho                                     |
+| Capacidade         | fila cheia                                | `PROCESS_QUEUE_FULL`                                                        |
+| Shutdown           | quatro ativos e executor fechado          | Aborto por `close()` e recusa após fechamento                               |
+| Handler            | `boom.mjs`                                | `PROCESS_HANDLER`, código e causa remotos                                   |
+| Serialização       | `unserializable.mjs` e payload com função | Falha no resultado e no request                                             |
+| Startup            | `crash.mjs`                               | Saída antes do handshake                                                    |
+| Protocolo          | `rogue.mjs`                               | Mensagem incompatível e `PROCESS_PROTOCOL`                                  |
+| Pool               | 8/32 tarefas, concorrência 1/4            | Criação sob demanda, reúso e fila                                           |
+| Reciclagem         | máximo de dois jobs                       | `max-jobs` e substituição de processos                                      |
 
-Os três seguintes medem o IPC em cada sentido separadamente — payload de 1 MiB e
-de 16 MiB com resultado minúsculo, e resultado de 16 MiB com payload minúsculo —
-e `eco estruturado` manda `Buffer`, `Map`, `Set`, `BigInt`, `Date`, `RegExp` e
-typed array em uma volta completa, conferindo o digest do que voltou.
+`stubborn.mjs` e `rogue.mjs` possuem limites internos de segurança; `hang.mjs` deliberadamente não resolve. Cada cenário é corrido contra um prazo de observação de quatro segundos e, se não assentar, o snapshot mostra `não assentou`. Esse prazo não cancela a Promise nem os processos subjacentes: uma regressão no encerramento ainda pode manter o runner vivo e exige inspeção/limpeza externa.
 
-Os dois casos de `cpu.mjs` rodam o mesmo trabalho em série e com quatro vagas.
+## Limitações
 
-O resto cobre um caminho terminal cada: timeout, timeout com escalada até
-SIGKILL, aborto durante a execução, aborto ainda na fila, fila cheia, `close()`
-com quatro filhos ativos, erro do handler, resultado não serializável, payload
-não serializável (que rejeita sem sequer criar processo), saída do filho durante
-o startup, violação de protocolo e `run()` depois de `close()`.
-
-## Diferenças entre sistemas
-
-O caso `timeout até sigkill` é o único que muda de forma visível de um sistema
-para outro. No Linux o worker recebe o SIGTERM, ignora, e só morre no SIGKILL
-disparado depois de `killGraceMs` — o caso custa o timeout mais a carência. No
-Windows não há entrega de sinal: o `kill` termina o processo direto, e o caso
-custa só o timeout. O snapshot acompanha essa diferença no campo `termination`,
-que sai `sigkill` no Linux e `sigterm` no Windows.
-
-Pela mesma razão, o campo `exit` guarda apenas `limpo` ou `encerrado`: um filho
-morto reporta sinal `SIGTERM` sem código no Linux e código 1 sem sinal no
-Windows. Compare execuções da mesma máquina.
-
-## Por que existe o prazo de 4 segundos
-
-Um benchmark que trava não reporta nada, e o modo de falha mais provável deste
-pacote é justamente uma tarefa que nunca assenta: o executor só entrega o
-resultado depois de confirmar o `close` do filho, então qualquer filho cujo
-`close` não chegue prende a Promise, prende `executor.close()` e prenderia a
-suíte inteira.
-
-Isso não é hipotético. A primeira execução desta suíte encontrou exatamente esse
-bug: `#beginTermination` chamava `child.disconnect()` antes do `SIGTERM`, e um
-`disconnect()` feito pelo pai suprime o `close` daquele filho — o `exit` chega, o
-`close` não. Todos os sete caminhos de encerramento imediato ficavam pendentes
-para sempre, no Windows com Node 24.11 e no Linux com Node 20.19. Reprodução
-mínima, sem envolver o pacote:
-
-```js
-import { fork } from "node:child_process";
-
-const child = fork(worker, [], { serialization: "advanced", stdio: ["ignore", "inherit", "inherit", "ipc"] });
-child.on("exit", () => console.log("exit"));
-child.on("close", () => console.log("close"));
-setTimeout(() => {
-  child.disconnect();
-  child.kill("SIGTERM");
-}, 200);
-```
-
-Isso imprime apenas `exit`. Sem o `disconnect()`, ou trocando-o por
-`child.channel?.unref()`, os dois eventos chegam — que é o que o executor faz
-hoje. O prazo fica como rede de proteção para a próxima regressão dessa família.
+- Os tempos dependem do custo de `fork`, do escalonador, do antivírus, do filesystem e da versão do Node.js.
+- O benchmark não mede contenção de rede ou disco dentro de handlers de aplicação.
+- RSS do pai não representa memória total dos filhos.
+- Payloads sintéticos ajudam na repetibilidade, mas não substituem medições com tamanhos e trabalho reais.
+- A comparação protege snapshots dos casos existentes; ela não prova ausência de falhas fora dos cenários cobertos.
+- Casos presentes somente no baseline são ignorados pelo comparador e precisam de revisão manual.

@@ -1,9 +1,12 @@
 import { deserialize, serialize } from "node:v8";
 
-import type { ProcessSerializationDirection, SerializedProcessError } from "./types";
+import type { ProcessExecutionMode, ProcessSerializationDirection, SerializedProcessError } from "./types";
 
 export const PROTOCOL_NAME = "cerne-isolate";
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
+
+/** Lists the lifecycle contracts this worker build understands. */
+export const SUPPORTED_MODES: readonly ProcessExecutionMode[] = Object.freeze(["disposable", "reusable"] as const);
 
 interface ProtocolEnvelope {
   protocol: typeof PROTOCOL_NAME;
@@ -12,12 +15,18 @@ interface ProtocolEnvelope {
 
 export interface RunMessage<Payload> extends ProtocolEnvelope {
   type: "run";
+  mode: ProcessExecutionMode;
   taskId: number;
   payload: Payload;
 }
 
+export interface ShutdownMessage extends ProtocolEnvelope {
+  type: "shutdown";
+}
+
 export interface ReadyMessage extends ProtocolEnvelope {
   type: "ready";
+  modes: ProcessExecutionMode[];
 }
 
 export interface ResultMessage<Result> extends ProtocolEnvelope {
@@ -42,6 +51,8 @@ export interface ProtocolErrorMessage extends ProtocolEnvelope {
   type: "protocol-error";
 }
 
+export type ParentMessage<Payload> = RunMessage<Payload> | ShutdownMessage;
+
 export type ChildMessage<Result> = ReadyMessage | ResultMessage<Result> | HandlerErrorMessage | SerializationErrorMessage | ProtocolErrorMessage;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -50,6 +61,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isTaskId(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function isExecutionMode(value: unknown): value is ProcessExecutionMode {
+  return value === "disposable" || value === "reusable";
+}
+
+function isModeList(value: unknown): value is ProcessExecutionMode[] {
+  return Array.isArray(value) && value.length > 0 && value.length <= 8 && value.every(isExecutionMode);
 }
 
 function isSerializedProcessError(value: unknown, depth = 0, seen = new Set<object>()): value is SerializedProcessError {
@@ -70,8 +89,14 @@ function hasProtocolEnvelope(value: Record<string, unknown>): boolean {
   return value.protocol === PROTOCOL_NAME && value.version === PROTOCOL_VERSION;
 }
 
-export function parseRunMessage(value: unknown): RunMessage<unknown> | null {
-  if (!isRecord(value) || !hasProtocolEnvelope(value) || value.type !== "run" || !isTaskId(value.taskId) || !("payload" in value)) {
+export function parseParentMessage(value: unknown): ParentMessage<unknown> | null {
+  if (!isRecord(value) || !hasProtocolEnvelope(value)) {
+    return null;
+  }
+  if (value.type === "shutdown") {
+    return value as unknown as ShutdownMessage;
+  }
+  if (value.type !== "run" || !isExecutionMode(value.mode) || !isTaskId(value.taskId) || !("payload" in value)) {
     return null;
   }
   return value as unknown as RunMessage<unknown>;
@@ -81,8 +106,11 @@ export function parseChildMessage(value: unknown): ChildMessage<unknown> | null 
   if (!isRecord(value) || !hasProtocolEnvelope(value) || typeof value.type !== "string") {
     return null;
   }
-  if (value.type === "ready" || value.type === "protocol-error") {
-    return value as unknown as ReadyMessage | ProtocolErrorMessage;
+  if (value.type === "ready") {
+    return isModeList(value.modes) ? (value as unknown as ReadyMessage) : null;
+  }
+  if (value.type === "protocol-error") {
+    return value as unknown as ProtocolErrorMessage;
   }
   if (!isTaskId(value.taskId)) {
     return null;
