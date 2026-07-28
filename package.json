@@ -1,0 +1,78 @@
+{
+  "name": "cerne-isolate",
+  "version": "0.1.0",
+  "updated": "2026.07.28.1140",
+  "description": "Executa tarefas Node.js em processos filhos descartáveis com IPC estruturado, timeout, cancelamento, concorrência limitada e encerramento confirmado.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./worker": {
+      "import": {
+        "types": "./dist/worker.d.ts",
+        "default": "./dist/worker.js"
+      },
+      "require": {
+        "types": "./dist/worker.d.cts",
+        "default": "./dist/worker.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "child-process",
+    "process-isolation",
+    "ipc",
+    "concurrency",
+    "timeout",
+    "cancellation",
+    "worker"
+  ],
+  "author": "devAlphaSystem",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsup ./src/index.ts ./src/worker.ts --no-config --format esm,cjs --dts --sourcemap --clean --no-splitting --platform node --target node20 --out-dir dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "bench": "node --expose-gc bench/run.mjs",
+    "security:audit": "npm audit --audit-level=low",
+    "check": "tsc --noEmit && eslint . && prettier --check . && npm run build",
+    "prepack": "npm run check",
+    "postinstall": "patch-package"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.2",
+    "eslint": "^10.8.0",
+    "patch-package": "^8.0.1",
+    "prettier": "3.9.4",
+    "tsup": "^8.5.1",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.65.0"
+  },
+  "overrides": {
+    "esbuild": "0.27.2"
+  }
+}
